@@ -31,7 +31,7 @@
 | **TanStack Query** | 服务端状态 | 配合 Server Actions 用于客户端缓存 |
 | **Zustand** | 客户端状态 | 轻量，UI 状态够用 |
 | **react-hook-form + zod** | 表单/校验 | |
-| **Auth.js v5 (NextAuth)** | 鉴权 | Credentials Provider 接国内短信 |
+| **Auth.js v5 (NextAuth)** | 鉴权 | Email Provider（验证码/magic link）+ 密码登录 |
 | **Sonner** | Toast | shadcn 推荐 |
 
 ### Backend
@@ -43,7 +43,7 @@
 | **PostgreSQL 16** | 主库 | |
 | **Redis 7** | 缓存 + BullMQ 队列 + 限流 + Session | |
 | **阿里云 OSS** | 生成产物存储 | 配 CDN |
-| **阿里云短信 / 腾讯云 SMS** | 手机验证码 | |
+| **阿里云邮件推送 (DirectMail)** | 邮箱验证码 / 通知 | 国内稳定便宜；或用 Resend |
 | **阿里云内容安全 (Green)** | 文本/图片审核 | 国内合规必须 |
 | **wechatpay-node-v3** | 微信支付 | JSAPI / Native / H5 |
 | **alipay-sdk** | 支付宝 | 当面付 / 电脑网站 / 手机网站 |
@@ -69,7 +69,7 @@
 | 未提队列 | **+ BullMQ + Redis** | 视频/图片生成必须异步 |
 | 未提对象存储 | **+ 阿里云 OSS + CDN** | 生成物不能进 DB |
 | 未提内容审核 | **+ 阿里云 Green** | 国内必备 |
-| Auth 方式未定 | **Auth.js v5 + Credentials** | NextAuth 不直接支持国内短信，需自己写 Provider |
+| Auth 方式未定 | **Auth.js v5 + Email Provider** | 只用邮箱验证码，省掉短信审核和费用 |
 | 部署只提 Docker | **+ ICP 备案、RDS、SLB、ACR** | 阿里云生产实践 |
 
 ---
@@ -82,7 +82,7 @@
 2. **公安备案**：ICP 通过后 30 天内做。
 3. **微信支付商户号**：mp.weixin.qq.com，需对公账户验证。
 4. **支付宝商户号**：open.alipay.com，企业自研模式。
-5. **阿里云短信签名 + 模板**：需提交营业执照审核，1–3 天。
+5. **阿里云邮件推送 (DirectMail)**：开通服务 + 配置发信域名（SPF/DKIM/MX 解析），1–2 天。
 6. **生成式 AI 服务备案**（依据《生成式人工智能服务管理暂行办法》）：如果对外提供生成服务，主体需向网信办备案。**这一项目前是行业灰色地带，许多中小平台先上线后跟进；建议至少把内容审核接入做扎实。**
 7. **隐私协议 / 用户协议 / 退款政策**：上线必备。
 
@@ -111,7 +111,7 @@
    ┌───────────┼───────────┬───────────┬───────────┐
    │           │           │           │           │
 ┌──▼──┐    ┌──▼──┐     ┌──▼──┐    ┌──▼──┐    ┌──▼──────────┐
-│ RDS │    │Redis│     │ OSS │    │ SMS │    │ 中转站 (上游)│
+│ RDS │    │Redis│     │ OSS │    │Email│    │ 中转站 (上游)│
 │ PG  │    │Tair │     │+CDN │    │Green│    │ OpenAI 兼容  │
 └─────┘    └─────┘     └─────┘    └─────┘    └─────────────┘
 ```
@@ -131,9 +131,9 @@
 // === 用户 & 鉴权 ===
 model User {
   id            String   @id @default(cuid())
-  phone         String?  @unique
-  email         String?  @unique
-  passwordHash  String?
+  email         String   @unique
+  emailVerifiedAt DateTime?
+  passwordHash  String?              // 可选：用户可设置密码作为备用登录方式
   nickname      String?
   avatarUrl     String?
   role          Role     @default(USER)   // USER | ADMIN | FINANCE
@@ -315,9 +315,11 @@ model AuditLog {
 ## 6. 关键子系统设计
 
 ### 6.1 鉴权（Auth.js v5）
-- **Credentials Provider** × 2：
-  - `phone-otp`：手机号 + 短信验证码（验证码 Redis 存 5 分钟，60 秒重发）
-  - `email-password`：邮箱 + 密码（bcrypt）
+- **Email Provider（主登录方式）**：邮箱 + 6 位验证码（OTP），Redis 存 10 分钟，60 秒重发
+  - 也可选 magic link 模式（点击邮件链接直接登录），更简单但移动端体验略差
+- **Credentials Provider（可选备用）**：邮箱 + 密码（bcrypt），用户首次登录后可在设置里加密码
+- 邮件发送：阿里云 DirectMail（生产）/ Resend（备用）/ MailHog（本地开发）
+- 防刷：同邮箱 60s 重发限制 + 同 IP 每小时 ≤10 次 + Cloudflare Turnstile 人机校验
 - Session：JWT（默认）+ Edge 中间件鉴权
 - RBAC：中间件读取 `session.user.role`，`/admin/*` 限 `ADMIN`
 
@@ -402,7 +404,7 @@ if-gen-ai/
 │   │   │   │   ├── payment/
 │   │   │   │   ├── oss/
 │   │   │   │   ├── moderation/
-│   │   │   │   └── sms/
+│   │   │   │   └── email/
 │   │   │   ├── messages/                  # i18n
 │   │   │   └── middleware.ts
 │   │   └── package.json
@@ -444,8 +446,8 @@ if-gen-ai/
 - [ ] 提交首个 PR，跑通 `pnpm dev`
 
 ### Phase 1 — Auth & 基础壳（3–5 天）
-- [ ] Auth.js v5 + 手机/邮箱登录
-- [ ] 阿里云短信对接（沙盒）
+- [ ] Auth.js v5 + 邮箱验证码登录（OTP）
+- [ ] 阿里云 DirectMail 对接（本地用 MailHog）
 - [ ] next-intl 中英双语
 - [ ] 首页 / 登录页 / 用户中心骨架
 - [ ] 用户表 + Session
